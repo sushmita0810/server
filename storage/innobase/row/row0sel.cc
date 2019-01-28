@@ -2698,23 +2698,19 @@ row_sel_convert_mysql_key_to_innobase(
 /**************************************************************//**
 Stores a non-SQL-NULL field in the MySQL format. The counterpart of this
 function is row_mysql_store_col_in_innobase_format() in row0mysql.cc. */
-void
-row_sel_field_store_in_mysql_format_func(
+void row_sel_field_store_in_mysql_format(
 	byte*		dest,
 	const mysql_row_templ_t* templ,
-#ifdef UNIV_DEBUG
 	const dict_index_t* index,
 	ulint		field_no,
-#endif /* UNIV_DEBUG */
 	const byte*	data,
 	ulint		len)
 {
 	byte*			ptr;
-#ifdef UNIV_DEBUG
 	const dict_field_t*	field
 		= templ->is_virtual
 			 ? NULL : dict_index_get_nth_field(index, field_no);
-#endif /* UNIV_DEBUG */
+	uint16_t unsigned_len;
 
 	ut_ad(len != UNIV_SQL_NULL);
 	UNIV_MEM_ASSERT_RW(data, len);
@@ -2739,16 +2735,21 @@ row_sel_field_store_in_mysql_format_func(
 			data++;
 		}
 
-		if (!templ->is_unsigned) {
+		unsigned_len = field ? field->col->unsigned_len : 0;
+
+		if (!templ->is_unsigned && len > unsigned_len) {
 			dest[len - 1] = (byte) (dest[len - 1] ^ 128);
 		}
 
-		ut_ad(templ->mysql_col_len == len);
+		ut_ad(templ->mysql_col_len == len
+		      || !index->table->not_redundant());
 		break;
 
 	case DATA_VARCHAR:
 	case DATA_VARMYSQL:
 	case DATA_BINARY:
+	case DATA_CHAR:
+	case DATA_FIXBINARY:
 		field_end = dest + templ->mysql_col_len;
 
 		if (templ->mysql_type == DATA_MYSQL_TRUE_VARCHAR) {
@@ -2836,7 +2837,8 @@ row_sel_field_store_in_mysql_format_func(
 		ut_ad(len * templ->mbmaxlen >= templ->mysql_col_len
 		      || (field_no == templ->icp_rec_field_no
 			  && field->prefix_len > 0)
-		      || templ->rec_field_is_prefix);
+		      || templ->rec_field_is_prefix
+		      || !index->table->not_redundant());
 
 		ut_ad(templ->is_virtual
 		      || !(field->prefix_len % templ->mbmaxlen));
@@ -2858,8 +2860,6 @@ row_sel_field_store_in_mysql_format_func(
 		ut_ad(0);
 		/* fall through */
 
-	case DATA_CHAR:
-	case DATA_FIXBINARY:
 	case DATA_FLOAT:
 	case DATA_DOUBLE:
 	case DATA_DECIMAL:
@@ -2886,8 +2886,7 @@ row_sel_field_store_in_mysql_format_func(
 @param[in]	templ			row template
 */
 static MY_ATTRIBUTE((warn_unused_result))
-ibool
-row_sel_store_mysql_field(
+bool row_sel_store_mysql_field(
 	byte*			mysql_rec,
 	row_prebuilt_t*		prebuilt,
 	const rec_t*		rec,
@@ -2949,7 +2948,7 @@ row_sel_store_mysql_field(
 
 			ut_a(prebuilt->trx->isolation_level
 			     == TRX_ISO_READ_UNCOMMITTED);
-			DBUG_RETURN(FALSE);
+			DBUG_RETURN(false);
 		}
 
 		ut_a(len != UNIV_SQL_NULL);
@@ -2980,7 +2979,7 @@ row_sel_store_mysql_field(
 			       (const byte*) prebuilt->default_rec
 			       + templ->mysql_col_offset,
 			       templ->mysql_col_len);
-			DBUG_RETURN(TRUE);
+			DBUG_RETURN(true);
 		}
 
 		if (DATA_LARGE_MTYPE(templ->type)
@@ -3021,7 +3020,7 @@ row_sel_store_mysql_field(
 			&= ~(byte) templ->mysql_null_bit_mask;
 	}
 
-	DBUG_RETURN(TRUE);
+	DBUG_RETURN(true);
 }
 
 /** Convert a row in the Innobase format to a row in the MySQL format.

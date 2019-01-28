@@ -47,6 +47,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "os0once.h"
 #include "fil0fil.h"
 #include "fil0crypt.h"
+#include "my_sys.h"
 #include <sql_const.h>
 #include <set>
 #include <algorithm>
@@ -581,6 +582,9 @@ struct dict_col_t{
 					this column. Our current max limit is
 					3072 (REC_VERSION_56_MAX_INDEX_COL_LEN)
 					bytes. */
+	unsigned	unsigned_len:16; /*!< before ALTER to signed the field
+					 was unsigned and was of this length. */
+
 private:
 	/** Special value of ind for a dropped column */
 	static const unsigned DROPPED = 1023;
@@ -685,15 +689,54 @@ public:
 	/** Determine if the columns have the same format
 	except for is_nullable() and is_versioned().
 	@param[in]	other	column to compare to
+	@param[in]	redundant table is redundant row format
 	@return	whether the columns have the same format */
-	bool same_format(const dict_col_t& other) const
+	bool same_format(const dict_col_t& other, bool redundant = false) const
 	{
-		return mtype == other.mtype
+		bool charset_equal = true;
+		if (dtype_is_non_binary_string_type(mtype, prtype)
+			&& dtype_is_non_binary_string_type(other.mtype,
+							   other.prtype)) {
+			uint csn1 = (uint) dtype_get_charset_coll(prtype);
+			uint csn2 = (uint) dtype_get_charset_coll(other.prtype);
+			CHARSET_INFO* cs1 = get_charset(csn1, MYF(MY_WME));
+			CHARSET_INFO* cs2 = get_charset(csn2, MYF(MY_WME));
+			charset_equal = my_charset_same(cs1, cs2);
+		}
+		bool mtype_equal = (mtype == other.mtype);
+		bool prtype_equal = !((prtype ^ other.prtype)
+				      & ~(DATA_NOT_NULL | DATA_VERSIONED));
+		if (redundant && !prtype_equal) {
+			std::set<int> s;
+			switch (other.mtype) {
+			case DATA_CHAR:
+			case DATA_MYSQL:
+			case DATA_VARCHAR:
+			case DATA_VARMYSQL:
+				s = {DATA_CHAR, DATA_MYSQL, DATA_VARCHAR,
+				     DATA_VARMYSQL};
+				mtype_equal = (s.find(mtype) != s.end());
+				prtype_equal = mtype_equal;
+				break;
+			case DATA_FIXBINARY:
+			case DATA_BINARY:
+				s = {DATA_FIXBINARY, DATA_BINARY};
+				mtype_equal = (s.find(mtype) != s.end());
+				prtype_equal = mtype_equal;
+				break;
+			case DATA_INT:
+				prtype_equal = true;
+				break;
+			default:
+				break;
+			}
+		}
+		return charset_equal
+			&& mtype_equal
+			&& prtype_equal
 			&& len >= other.len
 			&& mbminlen == other.mbminlen
-			&& mbmaxlen == other.mbmaxlen
-			&& !((prtype ^ other.prtype)
-			     & ~(DATA_NOT_NULL | DATA_VERSIONED));
+			&& mbmaxlen == other.mbmaxlen;
 	}
 };
 
@@ -1555,6 +1598,15 @@ class field_map_element_t
 	/** Set if the column was dropped and originally declared NOT NULL */
 	static constexpr uint16_t NOT_NULL = 1U << (IND_BITS + 4);
 
+	/** The field was unsigned before ALTER to signed:
+		0: never
+		1: tinyint
+		2: smallint
+		3: mediumint
+		4: int
+	*/
+	static constexpr uint16_t UNSIGNED_SIZE = 7U << (IND_BITS + 1);
+
 	/** Column index (if !(data & DROPPED)): table->cols[data & IND],
 	or field length (if (data & DROPPED)):
 	(data & IND) = 0 if variable-length with max_len < 256 bytes;
@@ -1571,6 +1623,15 @@ public:
 	void set_dropped() { data |= DROPPED; }
 	bool is_not_null() const { return data & NOT_NULL; }
 	void set_not_null() { ut_ad(is_dropped()); data |= NOT_NULL; }
+	uint16_t unsigned_len() const
+	{
+		return (data & UNSIGNED_SIZE) >> (IND_BITS + 1);
+	}
+	void or_unsigned_len(uint16_t unsigned_len)
+	{
+		ut_ad(unsigned_len <= 4);
+		data |= unsigned_len << (IND_BITS + 1);
+	}
 	uint16_t ind() const { return data & IND; }
 	void set_ind(uint16_t i)
 	{
@@ -1708,7 +1769,8 @@ struct dict_table_t {
 				    const ulint* col_map,
 				    unsigned& first_alter_pos);
 
-	/** Adjust table metadata for instant ADD/DROP/reorder COLUMN.
+	/** Adjust table metadata for instant ADD/DROP/reorder COLUMN,
+	unsigned -> bigger signed.
 	@param[in]	table	table on which prepare_instant() was invoked
 	@param[in]	col_map	mapping from cols[] and v_cols[] to table
 	@return		whether the metadata record must be updated */

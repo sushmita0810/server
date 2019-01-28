@@ -650,6 +650,9 @@ const char* dict_col_t::name(const dict_table_t& table) const
 	}
 
 	if (s) {
+		/* midenok: isn't it strange to use serialized array in memory?
+		TODO: Refactor to member dict_col_t::name, serialize only when
+		required. */
 		for (size_t i = 0; i < col_nr; i++) {
 			s += strlen(s) + 1;
 		}
@@ -2204,6 +2207,14 @@ dict_index_too_big_for_tree(
 		}
 
 		field_max_size = dict_col_get_max_size(col);
+		if (!comp && (col->mtype == DATA_INT
+			      || col->mtype == DATA_CHAR
+			      || col->mtype == DATA_FIXBINARY)) {
+			/* DATA_INT, DATA_FIXBINARY and DATA_CHAR are variable-
+			length (enlarged instantly), but are stored locally. */
+			field_ext_max_size = 0;
+			goto add_field_size;
+		}
 		field_ext_max_size = field_max_size < 256 ? 1 : 2;
 
 		if (field->prefix_len) {

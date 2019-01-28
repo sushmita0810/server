@@ -84,6 +84,7 @@ static const alter_table_operations INNOBASE_ALTER_REBUILD
 	| ALTER_OPTIONS
 	/* ALTER_OPTIONS needs to check alter_options_need_rebuild() */
 	| ALTER_COLUMN_NULLABLE
+	| ALTER_COLUMN_EQUAL_PACK_LENGTH
 	| INNOBASE_DEFAULTS
 	| ALTER_STORED_COLUMN_ORDER
 	| ALTER_DROP_STORED_COLUMN
@@ -132,7 +133,6 @@ static const alter_table_operations INNOBASE_ALTER_INSTANT
 #endif
 	| ALTER_ADD_VIRTUAL_COLUMN
 	| INNOBASE_FOREIGN_OPERATIONS
-	| ALTER_COLUMN_EQUAL_PACK_LENGTH
 	| ALTER_COLUMN_UNVERSIONED
 	| ALTER_DROP_VIRTUAL_COLUMN;
 
@@ -182,12 +182,16 @@ inline void dict_table_t::init_instant(const dict_table_t& table)
 	ut_d(unsigned n_nullable = 0);
 	for (unsigned i = u; i < index.n_fields; i++) {
 		auto& f = index.fields[i];
+		/* FIXME: CHAR of arbitrary size is now allowed. */
 		DBUG_ASSERT(dict_col_get_fixed_size(f.col, not_redundant())
-			    <= DICT_MAX_FIXED_COL_LEN);
+			    <= DICT_MAX_FIXED_COL_LEN
+			    || !not_redundant());
 		ut_d(n_nullable += f.col->is_nullable());
 
 		if (!f.col->is_dropped()) {
-			(*field_map_it++).set_ind(f.col->ind);
+			field_map_it->set_ind(f.col->ind);
+			field_map_it->or_unsigned_len(f.col->unsigned_len);
+			field_map_it++;
 			continue;
 		}
 
@@ -264,7 +268,8 @@ inline void dict_table_t::prepare_instant(const dict_table_t& old,
 		if (index.n_fields == oindex.n_fields) {
 			for (unsigned i = index.n_fields; i--; ) {
 				ut_ad(index.fields[i].col->same_format(
-					      *oindex.fields[i].col));
+						*oindex.fields[i].col,
+						!not_redundant()));
 			}
 		}
 #endif
@@ -452,9 +457,13 @@ inline void dict_index_t::instant_add_field(const dict_index_t& instant)
 	as this index. Fields for any added columns are appended at the end. */
 #ifndef DBUG_OFF
 	for (unsigned i = 0; i < n_fields; i++) {
-		DBUG_ASSERT(fields[i].same(instant.fields[i]));
-		DBUG_ASSERT(instant.fields[i].col->same_format(*fields[i]
-							       .col));
+		DBUG_ASSERT(fields[i].prefix_len
+			    == instant.fields[i].prefix_len);
+		DBUG_ASSERT(fields[i].fixed_len
+			    == instant.fields[i].fixed_len
+			    || !table->not_redundant());
+		DBUG_ASSERT(instant.fields[i].col->same_format(
+				*fields[i].col, !table->not_redundant()));
 		/* Instant conversion from NULL to NOT NULL is not allowed. */
 		DBUG_ASSERT(!fields[i].col->is_nullable()
 			    || instant.fields[i].col->is_nullable());
@@ -530,10 +539,17 @@ inline bool dict_table_t::instant_column(const dict_table_t& table,
 
 		if (const dict_col_t* o = find(old_cols, col_map, n_cols, i)) {
 			c.def_val = o->def_val;
-			DBUG_ASSERT(!((c.prtype ^ o->prtype)
-				      & ~(DATA_NOT_NULL | DATA_VERSIONED)));
-			DBUG_ASSERT(c.mtype == o->mtype);
-			DBUG_ASSERT(c.len >= o->len);
+			ut_ad(c.same_format(*o, !not_redundant()));
+
+			if (o->mtype == DATA_INT && !(c.prtype & DATA_UNSIGNED)) {
+				DBUG_ASSERT(c.mtype == o->mtype);
+				if (o->prtype & DATA_UNSIGNED) {
+					DBUG_ASSERT(c.len > o->len);
+					c.unsigned_len = o->len;
+				} else {
+					c.unsigned_len = o->unsigned_len;
+				}
+			}
 
 			if (o->vers_sys_start()) {
 				ut_ad(o->ind == vers_start);
@@ -1510,7 +1526,8 @@ instant_alter_column_possible(
 		= ALTER_ADD_STORED_BASE_COLUMN
 		| ALTER_DROP_STORED_COLUMN
 		| ALTER_STORED_COLUMN_ORDER
-		| ALTER_COLUMN_NULLABLE;
+		| ALTER_COLUMN_NULLABLE
+		| ALTER_COLUMN_EQUAL_PACK_LENGTH;
 
 	if (!(ha_alter_info->handler_flags & avoid_rebuild)) {
 		alter_table_operations flags = ha_alter_info->handler_flags
@@ -1551,6 +1568,7 @@ instant_alter_column_possible(
 	       & ~ALTER_STORED_COLUMN_ORDER
 	       & ~ALTER_ADD_STORED_BASE_COLUMN
 	       & ~ALTER_COLUMN_NULLABLE
+	       & ~ALTER_COLUMN_EQUAL_PACK_LENGTH
 	       & ~ALTER_OPTIONS)) {
 		return false;
 	}
@@ -2947,7 +2965,7 @@ innobase_col_to_mysql(
 
 	switch (col->mtype) {
 	case DATA_INT:
-		ut_ad(len == flen);
+		ut_ad(len <= flen);
 
 		/* Convert integer data from Innobase to little-endian
 		format, sign bit restored to normal */
@@ -2956,7 +2974,7 @@ innobase_col_to_mysql(
 			*--ptr = *data++;
 		}
 
-		if (!(col->prtype & DATA_UNSIGNED)) {
+		if (!(col->prtype & DATA_UNSIGNED) && len > col->unsigned_len) {
 			((byte*) dest)[len - 1] ^= 0x80;
 		}
 
@@ -4240,6 +4258,8 @@ innobase_build_col_map(
 				}
 
 				col_map[old_i - num_old_v] = i;
+				new_table->cols[i].unsigned_len =
+					old_table->cols[old_i].unsigned_len;
 				if (old_table->versioned()
 				    && altered_table->versioned()) {
 					if (old_i == old_table->vers_start) {
@@ -4972,7 +4992,7 @@ static bool innobase_insert_sys_virtual(
 	return false;
 }
 
-/** Insert a record to the SYS_COLUMNS dictionary table.
+/** Insert or update a record in the SYS_COLUMNS dictionary table.
 @param[in]	table_id	table id
 @param[in]	pos		position of the column
 @param[in]	field_name	field name
@@ -5587,7 +5607,8 @@ static bool innobase_instant_try(
 
 		bool update = old && (!ctx->first_alter_pos
 				      || i < ctx->first_alter_pos - 1);
-		DBUG_ASSERT(!old || col->same_format(*old));
+		ut_ad(!old || col->same_format(
+			*old, !user_table->not_redundant()));
 		if (update
 		    && old->prtype == d->type.prtype
 		    && old->len == d->type.len) {
@@ -5677,6 +5698,8 @@ add_all_virtual:
 		NULL, trx, ctx->heap, NULL);
 
 	dberr_t err = DB_SUCCESS;
+	DBUG_EXECUTE_IF("ib_instant_error",
+			err = DB_OUT_OF_FILE_SPACE; goto func_exit;);
 	if (rec_is_metadata(rec, *index)) {
 		ut_ad(page_rec_is_user_rec(rec));
 		if (!page_has_next(block->frame)
@@ -5769,9 +5792,6 @@ empty_table:
 		index->clear_instant_alter();
 		goto func_exit;
 	} else if (!user_table->is_instant()) {
-		ut_ad(!user_table->not_redundant()
-		      || (ha_alter_info->handler_flags
-			  & ALTER_COLUMN_UNVERSIONED));
 		goto func_exit;
 	}
 
@@ -9020,7 +9040,6 @@ as part of commit_cache_norebuild().
 static MY_ATTRIBUTE((nonnull))
 void
 innobase_rename_columns_cache(
-/*=====================================*/
 	Alter_inplace_info*	ha_alter_info,
 	const TABLE*		table,
 	dict_table_t*		user_table)
