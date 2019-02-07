@@ -83,7 +83,8 @@ buf_flush_init_for_writing(
 	const buf_block_t*	block,
 	byte*			page,
 	void*			page_zip_,
-	lsn_t			newest_lsn);
+	lsn_t			newest_lsn,
+	bool			use_full_checksum);
 
 # if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
 /********************************************************************//**

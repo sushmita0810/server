@@ -629,7 +629,7 @@ buf_dblwr_process()
 			    ? fil_space_verify_crypt_checksum(read_buf,
 							      zip_size)
 			    : !buf_page_is_corrupted(true, read_buf,
-						     zip_size, space)) {
+						     space->flags)) {
 				/* The page is good; there is no need
 				to consult the doublewrite buffer. */
 				continue;
@@ -651,7 +651,7 @@ bad:
 		if (expect_encrypted && mach_read_from_4(
 			    page + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION)
 		    ? !fil_space_verify_crypt_checksum(page, zip_size)
-		    : buf_page_is_corrupted(true, page, zip_size, space)) {
+		    : buf_page_is_corrupted(true, page, space->flags)) {
 			if (!is_all_zero) {
 bad_doublewrite:
 				ib::warn() << "A doublewrite copy of page "
@@ -806,11 +806,22 @@ buf_dblwr_check_page_lsn(
 		return;
 	}
 
+	bool lsn_mismatch = false;
+
 	if (memcmp(page + (FIL_PAGE_LSN + 4),
 		   page + (srv_page_size
 			   - FIL_PAGE_END_LSN_OLD_CHKSUM + 4),
 		   4)) {
 
+		if (memcmp(page + (FIL_PAGE_LSN + 4),
+			   page + (srv_page_size
+				   - FIL_PAGE_FCHKSUM_END_LSN),
+			   4)) {
+			lsn_mismatch = true;
+		}
+	}
+
+	if (lsn_mismatch) {
 		const ulint	lsn1 = mach_read_from_4(
 			page + FIL_PAGE_LSN + 4);
 		const ulint	lsn2 = mach_read_from_4(

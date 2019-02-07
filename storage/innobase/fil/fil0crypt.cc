@@ -537,14 +537,35 @@ fil_parse_write_crypt_data(
 	return ptr;
 }
 
+static byte* fil_encrypt_post_checksum(
+	byte*	dst_frame,
+	ulint	zip_size)
+{
+	/* handle post encryption checksum */
+	ib_uint32_t checksum = 0;
+
+	checksum = fil_crypt_calculate_checksum(zip_size, dst_frame);
+
+	/* store the post-encryption checksum after the key-version */
+	mach_write_to_4(
+		dst_frame + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION + 4,
+		checksum);
+
+	ut_ad(fil_space_verify_crypt_checksum(dst_frame, zip_size));
+
+	return dst_frame;
+}
+
 /** Encrypt a buffer.
-@param[in,out]		crypt_data	Crypt data
-@param[in]		space		space_id
-@param[in]		offset		Page offset
-@param[in]		lsn		Log sequence number
-@param[in]		src_frame	Page to encrypt
-@param[in]		zip_size	ROW_FORMAT=COMPRESSED page size, or 0
-@param[in,out]		dst_frame	Output buffer
+@param[in,out]		crypt_data		Crypt data
+@param[in]		space			space_id
+@param[in]		offset			Page offset
+@param[in]		lsn			Log sequence number
+@param[in]		src_frame		Page to encrypt
+@param[in]		zip_size		ROW_FORMAT=COMPRESSED
+						page size, or 0
+@param[in,out]		dst_frame		Output buffer
+@param[in]		use_full_checksum	full crc32 algo is used
 @return encrypted buffer or NULL */
 UNIV_INTERN
 byte*
@@ -555,7 +576,8 @@ fil_encrypt_buf(
 	lsn_t			lsn,
 	const byte*		src_frame,
 	ulint			zip_size,
-	byte*			dst_frame)
+	byte*			dst_frame,
+	bool			use_full_checksum)
 {
 	uint size = uint(zip_size ? zip_size : srv_page_size);
 	uint key_version = fil_crypt_get_latest_key_version(crypt_data);
@@ -608,15 +630,9 @@ fil_encrypt_buf(
 		       size - (header_len + srclen));
 	}
 
-	/* handle post encryption checksum */
-	ib_uint32_t checksum = 0;
-
-	checksum = fil_crypt_calculate_checksum(zip_size, dst_frame);
-
-	// store the post-encryption checksum after the key-version
-	mach_write_to_4(dst_frame + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION + 4, checksum);
-
-	ut_ad(fil_space_verify_crypt_checksum(dst_frame, zip_size));
+	if (!use_full_checksum) {
+		dst_frame = fil_encrypt_post_checksum(dst_frame, zip_size);
+	}
 
 	srv_stats.pages_encrypted.inc();
 
@@ -657,8 +673,12 @@ fil_space_encrypt(
 	fil_space_crypt_t* crypt_data = space->crypt_data;
 	const ulint zip_size = space->zip_size();
 	ut_ad(space->pending_io());
+
+	bool use_full_checksum = space->use_full_checksum();
+
 	byte* tmp = fil_encrypt_buf(crypt_data, space->id, offset, lsn,
-				    src_frame, zip_size, dst_frame);
+				    src_frame, zip_size, dst_frame,
+				    use_full_checksum);
 
 #ifdef UNIV_DEBUG
 	if (tmp) {
@@ -679,7 +699,10 @@ fil_space_encrypt(
 			}
 		}
 
-		ut_ad(!buf_page_is_corrupted(true, src, zip_size, space));
+		if (!use_full_checksum) {
+			ut_ad(!buf_page_is_corrupted(true, src, space->flags));
+		}
+
 		ut_ad(fil_space_decrypt(crypt_data, tmp_mem,
 					space->physical_size(), tmp,
 					&err));
@@ -695,7 +718,10 @@ fil_space_encrypt(
 
 		memcpy(tmp_mem + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION,
 		       src + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION, 8);
-		ut_ad(!memcmp(src, tmp_mem, space->physical_size()));
+
+		if (!use_full_checksum) {
+			ut_ad(!memcmp(src, tmp_mem, space->physical_size()));
+		}
 	}
 #endif /* UNIV_DEBUG */
 
@@ -2544,6 +2570,7 @@ bool fil_space_verify_crypt_checksum(const byte* page, ulint zip_size)
 	page is not corrupted. */
 
 	switch (srv_checksum_algorithm_t(srv_checksum_algorithm)) {
+	case SRV_CHECKSUM_ALGORITHM_STRICT_FULL_CRC32:
 	case SRV_CHECKSUM_ALGORITHM_STRICT_CRC32:
 		if (zip_size) {
 			return checksum == page_zip_calc_checksum(
@@ -2565,6 +2592,7 @@ bool fil_space_verify_crypt_checksum(const byte* page, ulint zip_size)
 		Due to this, we must treat "strict_innodb" as "innodb". */
 	case SRV_CHECKSUM_ALGORITHM_INNODB:
 	case SRV_CHECKSUM_ALGORITHM_CRC32:
+	case SRV_CHECKSUM_ALGORITHM_FULL_CRC32:
 		if (checksum == BUF_NO_CHECKSUM_MAGIC) {
 			return true;
 		}

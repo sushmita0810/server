@@ -714,22 +714,24 @@ buf_page_is_checksum_valid_none(
 	ulint				checksum_field2)
 	MY_ATTRIBUTE((nonnull(1), warn_unused_result));
 
+/** Checks if the page is in full crc32 checksum format.
+@param[in]	read_buf	database page
+@param[in]	checksum_field	checksum field
+@return true if the page is in full crc32 checksum format */
+bool buf_page_is_checksum_valid_full_crc32(
+	const byte*	read_buf,
+	ulint		checksum_field);
+
 /** Check if a page is corrupt.
 @param[in]	check_lsn	whether the LSN should be checked
 @param[in]	read_buf	database page
-@param[in]	zip_size	ROW_FORMAT=COMPRESSED page size, or 0
-@param[in]	space		tablespace
+@param[in]	fsp_flags	tablespace flags
 @return whether the page is corrupted */
 bool
 buf_page_is_corrupted(
 	bool			check_lsn,
 	const byte*		read_buf,
-	ulint			zip_size,
-#ifndef UNIV_INNOCHECKSUM
-	const fil_space_t* 	space = NULL)
-#else
-	const void* 	 	space = NULL)
-#endif
+	ulint			fsp_flags)
 	MY_ATTRIBUTE((warn_unused_result));
 
 #ifndef UNIV_INNOCHECKSUM

@@ -574,8 +574,7 @@ err_exit:
 		goto err_exit;
 	}
 
-	if (buf_page_is_corrupted(false, m_first_page,
-				  fil_space_t::zip_size(m_flags))) {
+	if (buf_page_is_corrupted(false, m_first_page, m_flags)) {
 		/* Look for checksum and other corruptions. */
 		error_txt = "Checksum mismatch";
 		goto err_exit;
@@ -664,6 +663,8 @@ Datafile::find_space_id()
 		byte*	page = static_cast<byte*>(
 			ut_align(buf, UNIV_SECTOR_SIZE));
 
+		ulint fsp_flags;
+
 		for (ulint j = 0; j < page_count; ++j) {
 
 			dberr_t		err;
@@ -681,13 +682,18 @@ Datafile::find_space_id()
 				continue;
 			}
 
+			if (j == 0) {
+				fsp_flags = mach_read_from_4(
+					page + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS);
+			}
+
 			bool	noncompressed_ok = false;
 
 			/* For noncompressed pages, the page size must be
 			equal to srv_page_size. */
 			if (page_size == srv_page_size) {
 				noncompressed_ok = !buf_page_is_corrupted(
-					false, page, 0, NULL);
+					false, page, fsp_flags);
 			}
 
 			bool	compressed_ok = false;
@@ -695,8 +701,7 @@ Datafile::find_space_id()
 			if (srv_page_size <= UNIV_PAGE_SIZE_DEF
 			    && page_size <= srv_page_size) {
 				compressed_ok = !buf_page_is_corrupted(
-					false, page,
-					page_size, NULL);
+					false, page, fsp_flags);
 			}
 
 			if (noncompressed_ok || compressed_ok) {

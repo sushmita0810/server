@@ -552,6 +552,10 @@ bool fil_node_t::read_page0(bool first)
 			size_bytes &= ~os_offset_t(mask);
 		}
 
+		if (fil_space_t::use_full_checksum(flags)) {
+			space->flags = flags;
+		}
+
 		this->size = ulint(size_bytes / psize);
 		space->size += this->size;
 	}
@@ -3018,7 +3022,12 @@ err_exit:
 
 	memset(page, '\0', srv_page_size);
 
-	flags |= FSP_FLAGS_PAGE_SSIZE();
+	if (fil_space_t::use_full_checksum(flags)) {
+		flags |= FSP_FLAGS_FCHKSUM_PAGE_SSIZE();
+	} else {
+		flags |= FSP_FLAGS_PAGE_SSIZE();
+	}
+
 	fsp_header_init_fields(page, space_id, flags);
 	mach_write_to_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, space_id);
 
@@ -3032,12 +3041,16 @@ err_exit:
 			page_zip.m_end = page_zip.m_nonempty =
 			page_zip.n_blobs = 0;
 
-		buf_flush_init_for_writing(NULL, page, &page_zip, 0);
+		buf_flush_init_for_writing(
+			NULL, page, &page_zip, 0,
+			fil_space_t::use_full_checksum(flags));
 
 		*err = os_file_write(
 			IORequestWrite, path, file, page_zip.data, 0, zip_size);
 	} else {
-		buf_flush_init_for_writing(NULL, page, NULL, 0);
+		buf_flush_init_for_writing(
+			NULL, page, NULL, 0,
+			fil_space_t::use_full_checksum(flags));
 
 		*err = os_file_write(
 			IORequestWrite, path, file, page, 0, srv_page_size);
@@ -3860,6 +3873,34 @@ fil_file_readdir_next_file(
 	return(-1);
 }
 
+/** Check whether both flags are equivalent.
+@param[in]	space_flags	flags stored in tablespace
+@param[in]	flags		flags stored in sys_tables
+@return whether the flags are equivalent. */
+static bool fsp_flags_equivalent(ulint space_flags, ulint flags)
+{
+	if (!fil_space_t::use_full_checksum(space_flags)) {
+		return !((space_flags ^ flags)
+			 & ~(1U << FSP_FLAGS_POS_RESERVED));
+	}
+
+	/* Check whether new checksum flag are logical equivalent to
+	the table flags. */
+	ulint page_ssize = FSP_FLAGS_GET_PAGE_SSIZE(flags);
+	ulint space_page_ssize = FSP_FLAGS_FCHKSUM_GET_PAGE_SSIZE(space_flags);
+
+	if (page_ssize == 0 && space_page_ssize != 5) {
+		return false;
+	} else if (page_ssize != 0 && (page_ssize != space_page_ssize)) {
+		return false;
+	}
+
+	bool is_compressed = fil_space_t::is_compressed(flags);
+	bool is_space_compressed = fil_space_t::is_compressed(space_flags);
+
+	return is_compressed == is_space_compressed;
+}
+
 /** Try to adjust FSP_SPACE_FLAGS if they differ from the expectations.
 (Typically when upgrading from MariaDB 10.1.0..10.1.20.)
 @param[in,out]	space		tablespace
@@ -3882,20 +3923,21 @@ void fsp_flags_try_adjust(fil_space_t* space, ulint flags)
 		    RW_X_LATCH, &mtr)) {
 		ulint f = fsp_header_get_flags(b->frame);
 		/* Suppress the message if only the DATA_DIR flag to differs. */
-		if ((f ^ flags) & ~(1U << FSP_FLAGS_POS_RESERVED)) {
+		bool is_equal = fsp_flags_equivalent(f, flags);
+		if (!is_equal) {
 			ib::warn()
 				<< "adjusting FSP_SPACE_FLAGS of file '"
 				<< UT_LIST_GET_FIRST(space->chain)->name
 				<< "' from " << ib::hex(f)
 				<< " to " << ib::hex(flags);
-		}
-		if (f != flags) {
+
 			mtr.set_named_space(space);
 			mlog_write_ulint(FSP_HEADER_OFFSET
 					 + FSP_SPACE_FLAGS + b->frame,
 					 flags, MLOG_4BYTES, &mtr);
 		}
 	}
+
 	mtr.commit();
 }
 
